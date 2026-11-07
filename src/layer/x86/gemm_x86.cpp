@@ -3,6 +3,8 @@
 
 #include "gemm_x86.h"
 
+#include <limits.h>
+
 #if __SSE2__
 #include <emmintrin.h>
 #include "sse_mathfun.h"
@@ -3532,11 +3534,185 @@ static int gemm_AT_BT_x86(const Mat& AT, const Mat& BT, const Mat& C, Mat& top_b
     return 0;
 }
 
+#include "gemm_wq_w4.h"
+
+#if NCNN_WEIGHT_QUANT && __AVX512F__ && __AVX512BW__
+int Gemm_x86::create_pipeline_wq_w4(const Option& opt)
+{
+    const int K = constantK;
+    const int N = constantN;
+    const int block_size = weight_block_quantize_block_size;
+    if (K <= 0 || N <= 0 || block_size <= 0)
+        return -1;
+    const size_t groups = ((size_t)K + 3) / 4;
+    const size_t tiles = ((size_t)N + 15) / 16;
+    const size_t blocks = ((size_t)K + block_size - 1) / block_size;
+    const size_t packed_width = (((size_t)K + 1) / 2) * 16;
+    if (groups > (size_t)INT_MAX / 32 || blocks > (size_t)INT_MAX / 16 || tiles > (size_t)INT_MAX)
+        return -100;
+    // Reserve Mat's 16-byte rounding/refcount and the largest fastMalloc overhead.
+    const size_t allocation_limit = (size_t)-1 - 15 - sizeof(int) - sizeof(void*) - NCNN_MALLOC_ALIGN - NCNN_MALLOC_OVERREAD;
+    if (tiles > allocation_limit / (groups * 32) || tiles > allocation_limit / (blocks * 16 * sizeof(float)))
+        return -100;
+    BT_data_wq_w4.create((int)packed_width, (int)tiles, (size_t)1u, (Allocator*)0);
+    BT_data_wq_w4_descales.create((int)(blocks * 16), (int)tiles, (size_t)4u, (Allocator*)0);
+    if (BT_data_wq_w4.empty() || BT_data_wq_w4_descales.empty())
+    {
+        BT_data_wq_w4.release();
+        BT_data_wq_w4_descales.release();
+        return -100;
+    }
+    const size_t rowbytes = ((size_t)K + 1) / 2;
+    if (rowbytes <= (size_t)INT_MAX / 15 && blocks <= (size_t)INT_MAX / 15)
+    {
+        const __m512i lanes = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        const __m512i weight_offsets = _mm512_mullo_epi32(lanes, _mm512_set1_epi32((int)rowbytes));
+        const __m128i shuffle128 = _mm_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+        const __m512i shuffle = _mm512_broadcast_i32x4(shuffle128);
+        const __m512i permute = _mm512_setr_epi32(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+        for (int tile = 0; tile < (int)tiles; tile++)
+        {
+            const int valid = std::min(16, N - tile * 16);
+            const __mmask16 mask = (__mmask16)((1u << valid) - 1u);
+            const unsigned char* source = B_data.row<const unsigned char>(tile * 16);
+            unsigned char* target = BT_data_wq_w4.row<unsigned char>(tile);
+            size_t byte = 0;
+            for (; byte + 4 <= rowbytes; byte += 4)
+            {
+                __m512i values = _mm512_mask_i32gather_epi32(_mm512_setzero_si512(), mask, weight_offsets, source + byte, 1);
+                values = _mm512_shuffle_epi8(values, shuffle);
+                values = _mm512_permutexvar_epi32(permute, values);
+                _mm512_storeu_si512((void*)(target + byte * 16), values);
+            }
+            for (; byte < rowbytes; byte++)
+            {
+                for (int lane = 0; lane < 16; lane++)
+                    target[byte * 16 + lane] = lane < valid ? source[(size_t)lane * rowbytes + byte] : 0;
+            }
+            float* descales = BT_data_wq_w4_descales.row(tile);
+            memset(descales, 0, blocks * 16 * sizeof(float));
+            for (int lane = 0; lane < valid; lane++)
+            {
+                const float* scales = B_data_quantize_scales.row(tile * 16 + lane);
+                for (int b = 0; b < (int)blocks; b++)
+                    descales[(size_t)b * 16 + lane] = 1.f / scales[b];
+            }
+        }
+    }
+    else
+    {
+        for (int tile = 0; tile < (int)tiles; tile++)
+        {
+            unsigned char* indices = BT_data_wq_w4.row<unsigned char>(tile);
+            float* descales = BT_data_wq_w4_descales.row(tile);
+            memset(indices, 0, packed_width);
+            memset(descales, 0, blocks * 16 * sizeof(float));
+            for (int lane = 0; lane < 16 && tile * 16 + lane < N; lane++)
+            {
+                const int n = tile * 16 + lane;
+                const unsigned char* weights = B_data.row<const unsigned char>(n);
+                const float* scales = B_data_quantize_scales.row(n);
+                for (int b = 0; b < (int)blocks; b++)
+                    descales[(size_t)b * 16 + lane] = 1.f / scales[b];
+                for (size_t byte = 0; byte < ((size_t)K + 1) / 2; byte++)
+                    indices[byte * 16 + lane] = weights[byte];
+            }
+        }
+    }
+    if (opt.lightmode)
+    {
+        B_data.release();
+        B_data_quantize_scales.release();
+    }
+    return 0;
+}
+
+int Gemm_x86::forward_wq_w4(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
+{
+    const Mat& A = bottom_blobs[0];
+
+    const int K = transA ? (A.dims == 3 ? A.c : A.h) * A.elempack : A.w;
+    const int block_size = weight_block_quantize_block_size;
+
+    const int M = transA ? A.w : (A.dims == 3 ? A.c : A.h) * A.elempack;
+    const int N = constantN;
+    if (K != constantK || M <= 0 || A.elempack != 1 || A.elemsize != 4u)
+        return -1;
+
+    Mat C;
+    int broadcast_type_C = 0;
+    if (constantC)
+    {
+        C = C_data;
+        broadcast_type_C = constant_broadcast_type_C;
+    }
+    else
+    {
+        if (bottom_blobs.size() == 2)
+        {
+            C = bottom_blobs[1];
+        }
+
+        if (!C.empty())
+        {
+            if (C.dims == 1 && C.w == 1)
+            {
+                broadcast_type_C = 0;
+            }
+            if (C.dims == 1 && C.w == M)
+            {
+                broadcast_type_C = 1;
+            }
+            if (C.dims == 1 && C.w == N)
+            {
+                broadcast_type_C = 4;
+            }
+            if (C.dims == 2 && C.w == 1 && C.h == M)
+            {
+                broadcast_type_C = 2;
+            }
+            if (C.dims == 2 && C.w == N && C.h == M)
+            {
+                broadcast_type_C = 3;
+            }
+            if (C.dims == 2 && C.w == N && C.h == 1)
+            {
+                broadcast_type_C = 4;
+            }
+        }
+    }
+
+    Mat& top_blob = top_blobs[0];
+    if (output_transpose)
+    {
+        if (output_N1M)
+            top_blob.create(M, 1, N, (size_t)4u, opt.blob_allocator);
+        else
+            top_blob.create(M, N, (size_t)4u, opt.blob_allocator);
+    }
+    else
+    {
+        if (output_N1M)
+            top_blob.create(N, 1, M, (size_t)4u, opt.blob_allocator);
+        else
+            top_blob.create(N, M, (size_t)4u, opt.blob_allocator);
+    }
+    if (top_blob.empty())
+        return -100;
+
+    return gemm_wq_w4_direct(A, BT_data_wq_w4, BT_data_wq_w4_descales, B_data_input_scales, C, top_blob, broadcast_type_C, M, N, K, block_size, alpha, beta, opt);
+}
+#endif
+
 int Gemm_x86::create_pipeline(const Option& opt)
 {
     if (weight_block_quantize)
     {
 #if NCNN_WEIGHT_QUANT
+#if __AVX512F__ && __AVX512BW__
+        if (weight_block_quantize_bits == 4)
+            return create_pipeline_wq_w4(opt);
+#endif
         if (weight_block_quantize_bits == 8)
             return create_pipeline_wq_int8(opt);
 #endif // NCNN_WEIGHT_QUANT
@@ -3701,6 +3877,10 @@ int Gemm_x86::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& to
     if (weight_block_quantize)
     {
 #if NCNN_WEIGHT_QUANT
+#if __AVX512F__ && __AVX512BW__
+        if (weight_block_quantize_bits == 4)
+            return forward_wq_w4(bottom_blobs, top_blobs, opt);
+#endif
         if (weight_block_quantize_bits == 8)
             return forward_wq_int8(bottom_blobs, top_blobs, opt);
 #endif

@@ -735,6 +735,28 @@ int main()
     if (ret != 0)
         return ret;
 
+    // Single-row decode, N16 boundaries, and partial quantization blocks.
+    const int w4_mnkb[][4] = {
+        {1, 15, 31, 32},
+        {1, 16, 32, 32},
+        {1, 17, 33, 32},
+        {3, 17, 65, 64},
+        {3, 33, 129, 128}
+    };
+    for (int i = 0; i < (int)(sizeof(w4_mnkb) / sizeof(w4_mnkb[0])); i++)
+    {
+        const int M = w4_mnkb[i][0];
+        const int N = w4_mnkb[i][1];
+        const int K = w4_mnkb[i][2];
+        const int block_size = w4_mnkb[i][3];
+        ret = test_gemm(M, N, K, 4, block_size)
+              || test_gemm(M, N, K, 4, block_size, 1)
+              || test_gemm(M, N, K, 4, block_size, 1, 0, 0, 0, 1)
+              || test_gemm_bias(M, N, K, 4, block_size, RandomMat(N, M), -0.7f, 1.3f, 1, 0, 0, 0);
+        if (ret != 0)
+            return ret;
+    }
+
     const int mnkb[][4] = {
         {31, 31, 35, 32},
         {12, 20, 68, 64},
